@@ -1,0 +1,338 @@
+= Customizing basic value mapping in ORM 6
+:awestruct-tags: [ "Hibernate ORM" ]
+:awestruct-layout: blog-post
+:icons: font
+Jan Schatteman <jschatte@redhat.com>
+
+
+Much has changed in ORM 6.0 with regard to its type system.
+
+The https://docs.jboss.org/hibernate/orm/6.0/userguide/html_single/Hibernate_User_Guide.html#basic[User Guide]
+does a good job covering the mapping of basic values, but this post digs a little deeper into the effects
+of those changes on the handling and mapping of basic values.
+
+Historically Hibernate provided 3 ways to customize the mapping of a basic value -
+
+* `UserType`
+* `BasicType`
+* `AttributeConverter`
+
+6.0 removes the ability to customize mappings through a custom `BasicType`, but adds a new "compositional" approach.
+
+== UserType
+
+
+
+From version 6.0, Hibernate basically provides 2 different ways to contribute a custom type mapping; there still is the legacy way of doing it through the org.hibernate.usertype.UserType contract with the @Type annotation, and now there is also the newly introduced way of compositional type mapping, which provides a number of new annotations (@JavaType, @JdbcType, @JavaTypeRegistry, @JdbcTypeRegistry) to tell Hibernate what the java and/or jdbc type is that it should use for a specific mapping. Hibernate also needs to know about any potential conversion that should happen to/from the database (AttributeConverters), and the mutability of the mapped value (@Mutability, @Immutable, etc).
+
+Please refer to the https://docs.jboss.org/hibernate/orm/6.0/userguide/html_single/Hibernate_User_Guide.html[user guide] and the https://docs.jboss.org/hibernate/orm/6.0/migration-guide/migration-guide.html[migration guide] for more in depth coverage of these topics.
+
+Let's attempt to illustrate the above with some examples.
+
+So, say for example that you have a `Product` entity, and for some reason you would need that to have a property of type `java.util.BitSet`, as shown in the example below :
+====
+[source, JAVA, indent=0]
+----
+    @Table(name = "products")
+    @Entity(name = "Product")
+    public static class Product {
+        @Id
+        private Integer id;
+
+        private BitSet bitSet;
+
+    //Constructors, getters, and setters are omitted for brevity
+    }
+----
+====
+
+We'll admit that this example is a bit contrived, but for the sake of argument it is useful, because Hibernate does not provide an out-of-the-box specific method for persisting BitSet. Hence, since however BitSet *is* Serializable, and since we haven't given Hibernate any other clue as to how to treat this type of attribute, that's the ultimate method that it will fall back on to persist this attribute's state to the database.
+
+This is probably not how you would want to persist this though, so let's look at ways to change this default behaviour.
+
+In case you want to strictly adhere to the JPA specification, you really only have one option, and that is to decorate the `BitSet` attribute with a `jakarta.persistence.AttributeConverter` :
+
+.Using an AttributeConverter
+====
+[source, JAVA, indent=0]
+----
+    @Table(name = "products")
+    @Entity(name = "Product")
+    public static class Product {
+        @Id
+        private Integer id;
+
+        @Convert(converter = BitSetConverter.class)
+        private BitSet bitSet;
+
+        //Constructors, getters, and setters are omitted for brevity
+    }
+
+    @Converter(autoApply = true)
+    public static class BitSetConverter implements AttributeConverter<BitSet,String> {
+        @Override
+        public String convertToDatabaseColumn(BitSet attribute) {
+            return BitSetHelper.bitSetToString(attribute);
+        }
+
+        @Override
+        public BitSet convertToEntityAttribute(String dbData) {
+            return BitSetHelper.stringToBitSet(dbData);
+        }
+    }
+----
+====
+In the above example the `AttributeConverter` implementation was marked with `'autoApply = true'`, which will apply it to all attributes of the `BitSet` type in all entities that are known to Hibernate.
+
+WARNING: for this to work, the converter needs to be registered in the `persistence.xml`, since Hibernate doesn't auto-discover them (yet)
+====
+[source, XML, indent=0]
+----
+    <persistence-unit ...>
+        ...
+        <class>BitSetConverter</class>
+        ...
+    </persistence-unit>
+----
+====
+
+
+If strict adherence to the JPA specification is not a concern, you may also tell Hibernate how to treat the attribute by specifying a custom `org.hibernate.type.descriptor.java.JavaType` and/or `org.hibernate.type.descriptor.java.JdbcType`
+
+[#BitSetJavaType-a]
+.Custom BitSet java type
+====
+[source, JAVA, indent=0]
+----
+public class BitSetJavaType extends AbstractClassJavaType<BitSet> {
+    public static final BitSetJavaType INSTANCE = new BitSetJavaType();
+
+    public BitSetJavaType() {
+        super(BitSet.class);
+    }
+
+    @Override
+    public MutabilityPlan<BitSet> getMutabilityPlan() {
+        return BitSetMutabilityPlan.INSTANCE;
+    }
+
+    @Override
+    public JdbcType getRecommendedJdbcType(JdbcTypeIndicators indicators) {
+        return indicators.getTypeConfiguration()
+                .getJdbcTypeRegistry()
+                .getDescriptor(Types.VARCHAR);
+    }
+
+    @Override
+    public String toString(BitSet value) {
+        return BitSetHelper.bitSetToString(value);
+    }
+
+    @Override
+    public BitSet fromString(CharSequence string) {
+        return BitSetHelper.stringToBitSet(string.toString());
+    }
+
+    @SuppressWarnings("unchecked")
+    public <X> X unwrap(BitSet value, Class<X> type, WrapperOptions options) {
+        if (value == null) {
+            return null;
+        }
+        if (BitSet.class.isAssignableFrom(type)) {
+            return (X) value;
+        }
+        if (String.class.isAssignableFrom(type)) {
+            return (X) toString(value);
+        }
+        if (type.isArray()) {
+            if (type.getComponentType() == byte.class) {
+                return (X) value.toByteArray();
+            }
+        }
+        throw unknownUnwrap(type);
+    }
+
+    public <X> BitSet wrap(X value, WrapperOptions options) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof CharSequence) {
+            return fromString((CharSequence) value);
+        }
+        if (value instanceof BitSet) {
+            return (BitSet) value;
+        }
+        throw unknownWrap(value.getClass());
+    }
+
+}
+----
+====
+
+We can then apply this either locally to the Product's `bitSet` attribute by annotating it with `@JavaType`
+
+.Apply a custom JavaType locally
+====
+[source, JAVA, indent=0]
+----
+    ...
+    @JavaType(BitSetJavaType.class)
+    private BitSet bitSet;
+    ...
+----
+====
+
+Or, on the other hand, apply it globally, i.e. to all attributes of type `BitSet`, by registering the custom `JavaType` using the `@JavaTypeRegistration` annotation:
+
+.Apply a custom JavaType globally
+====
+[source, JAVA, indent=0]
+----
+    @Entity(name = "Product")
+    @JavaTypeRegistration(javaType = BitSet.class, descriptorClass = BitSetJavaType.class)
+    public static class Product {
+        @Id
+        private Integer id;
+
+        private BitSet bitSet;
+
+        //Constructors, getters, and setters are omitted for brevity
+    }
+----
+====
+Now, in our "<<BitSetJavaType-a>>" above, we're mapping the `BitSet` to a Jdbc `VARCHAR`. It may very well be that for a certain `BitSet` attribute in some other Entity in your application you do not want this Jdbc type, but instead you want to map it to another Jdbc type, such as `VARBINARY`, for instance.
+In such case you can override the global mapping defined by the custom `BitSetJavaType` by indicating the Jdbc type that should be used on this particular attribute. This can be achieved by either specifying a `@JdbcTypeCode` on the attribute
+
+.Apply a specific Jdbc Type locally
+====
+[source, JAVA, indent=0]
+----
+    @Entity(name = "SomeOtherEntity")
+    public static class Product {
+        @Id
+        private Integer id;
+
+        @JdbcTypeCode(Types.VARBINARY)
+        private BitSet anotherBitSet;
+
+        //Constructors, getters, and setters are omitted for brevity
+    }
+----
+====
+or, alternatively, by implementing a custom `JdbcType` interface:
+
+.Apply a custom Jdbc Mapping locally
+====
+[source, JAVA, indent=0]
+----
+    @Entity(name = "Product")
+    public static class Product {
+        @Id
+        private Integer id;
+
+        @JdbcType(CustomBinaryJdbcType.class)
+        private BitSet bitSet;
+
+        //Constructors, getters, and setters are omitted for brevity
+    }
+
+    public class CustomBinaryJdbcType implements JdbcType {
+        @Override
+        public int getJdbcTypeCode() {
+            return Types.VARBINARY;
+        }
+
+        @Override
+        public <X> ValueBinder<X> getBinder(JavaType<X> javaType) {
+            return VarbinaryJdbcType.INSTANCE.getBinder( javaType );
+        }
+
+        @Override
+        public <X> ValueExtractor<X> getExtractor(JavaType<X> javaType) {
+            return VarbinaryJdbcType.INSTANCE.getExtractor( javaType );
+        }
+    }
+----
+====
+
+NOTE: Bear in mind that the conversion to the Jdbc type that you map an attribute to, needs to be known by Hibernate, either because the attribute is a `JavaType` that Hibernate already knows about, or because you have provided that conversion in your custom `JavaType`. Say, for example that for a certain entity you would want to save the `BitSet` as an `Integer` (and again, this is just an example), then your `BitSetJavaType` would need to account for that in its `wrap/unwrap` methods
+
+.Provide *all* the necessary conversions
+====
+[source, JAVA, indent=0]
+----
+    @Entity(name = "SomeOtherEntity")
+    public static class YetAnotherEntity {
+        @Id
+        private Integer id;
+
+        @JdbcTypeCode(Types.INTEGER)
+        private BitSet anotherBitSet;
+
+        //Constructors, getters, and setters are omitted for brevity
+    }
+
+    public class BitSetJavaType extends AbstractClassJavaType<BitSet> {
+        public static final BitSetJavaType INSTANCE = new BitSetJavaType();
+
+        ...
+
+        @SuppressWarnings("unchecked")
+        public <X> X unwrap(BitSet value, Class<X> type, WrapperOptions options) {
+
+            ...
+
+            if (Integer.class.isAssignableFrom(type)) {
+                // Do the conversion from BitSet to Integer
+            }
+
+            ...
+
+        }
+
+        public <X> BitSet wrap(X value, WrapperOptions options) {
+
+            ...
+
+            if (value instanceof Integer) {
+                // Do the conversion from Integer to BitSet
+            }
+
+            ...
+
+        }
+    }
+----
+====
+
+Finally, in very much the same way as we did in order to configure a JavaType globally, we can also define a JdbcType globally, by using @JdbcRegistration:
+
+.Apply a custom Jdbc Mapping globally
+====
+[source, JAVA, indent=0]
+----
+    @Entity(name = "Product")
+    @JdbcTypeRegistration(CustomBinaryJdbcType.class)
+    public static class Product {
+        @Id
+        private Integer id;
+
+        private BitSet bitSet;
+
+        //Constructors, getters, and setters are omitted for brevity
+    }
+----
+====
+
+
+---
+
+IMPORTANT: #Anything else missing? #
+
+---
+== Wrap-up
+With the advent of Hibernate 6, new tools to customize a basic attribute mapping have been introduced, as well as ways to apply those on local or global levels, making it much easier for developers to adapt Hibernate to their needs.
+
+---
+
+#ugh. that sounds like a sales pitch#
