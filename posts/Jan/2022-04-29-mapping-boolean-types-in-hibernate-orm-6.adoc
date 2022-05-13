@@ -1,0 +1,149 @@
+= Mapping Boolean attributes in ORM 6
+:awestruct-tags: [ "Hibernate ORM" ]
+:awestruct-layout: blog-post
+:icons: font
+Jan Schatteman <jschatte@redhat.com>
+
+By default, Hibernate maps a Boolean value to a BOOLEAN column. However, not all databases have a built-in BOOLEAN datatype and not all applications will want to use BOOLEAN (legacy schema e.g.).
+
+Hibernate provides multiple ways to map Boolean value to other SQL types; this post explores the most common ways.
+
+.Implicit Boolean mapping
+====
+[source, JAVA, indent=0]
+----
+
+    @Basic
+    private boolean aBoolean;
+
+----
+====
+How Hibernate chooses to map a boolean implicitly is determined by a series of cascading checks:
+
+1. It first checks whether the link:{javadoc-AvailableSettings}#PREFERRED_BOOLEAN_JDBC_TYPE[hibernate.type.preferred_boolean_jdbc_type] setting has been specified and, if so, uses it;
+2. Next it consults the link:{javadoc-Dialect}#getPreferredSqlTypeCodeForBoolean[Dialect] to see if it reports a preferred SQL type and, if so, uses it;
+3. Otherwise it will use link:{javadoc-Types}#BOOLEAN[Types.BOOLEAN]
+
+This default, 'implicit' mapping can be modified in several ways.
+
+== JPA compliant, using AttributeConverter
+
+Out of the box, Hibernate provides 3 `AttributeConverters`
+
+* YesNoConverter encodes a boolean value as 'Y' or 'N',
+* TrueFalseConverter encodes a boolean value as 'T' or 'F', and
+* NumericBooleanConverter encodes the value as an integer, 1 for true, and 0 for false.
+
+.Using built-in AttributeConverters
+====
+[source, JAVA, indent=0]
+----
+// this will get mapped to CHAR or NCHAR
+@Basic
+@Convert(converter = org.hibernate.type.YesNoConverter.class)
+boolean convertedYesNo;
+
+// this will get mapped to CHAR or NCHAR
+@Basic
+@Convert(converter = org.hibernate.type.TrueFalseConverter.class)
+boolean convertedTrueFalse;
+
+// this will get mapped to TINYINT
+@Basic
+@Convert(converter = org.hibernate.type.NumericBooleanConverter.class)
+boolean convertedNumeric;
+----
+====
+In the above examples, the converter will only be applied to the specific attribute that is annotated. So, what if you want to apply such a converter to all Boolean attributes in your application? Until now this would have required you to either define a custom `AttributeConverter` (see below), by, for example, extending either one of the available ones described above, and setting `autoApply` on it to `true`.
+
+NOTE: in impending ORM 6.1 release, a new `@ConverterRegistration` was added to make this much easier. It allows modifying certain aspects of already defined `AttributeConverters`, such as the application domain (`autoApply`) or change the data type the conversion should be applied on to another compatible data type (e.g. a subclass of the original data type).
+
+.Customizing built-in AttributeConverters
+====
+[source, JAVA, indent=0]
+----
+// this will apply the converter to all Boolean attributes
+@Basic
+@ConverterRegistration( converter = org.hibernate.type.YesNoConverter.class, autoApply = true )
+boolean convertedYesNo;
+
+----
+====
+
+If a more unusual conversion is needed to map this kind of attribute to the database, one can also implement a custom `AttributeConverter` - check link:{user-guide-url}#basic-jpa-convert[AttributeConverters] for more info.
+
+Such a custom `AttributeConverter` can also be applied to all the Boolean attributes, by setting its `autoApply` attribute to true.
+
+.Defining an AttributeConverter as global
+====
+[source, JAVA, indent=0]
+----
+
+    @Converter(autoApply = true)
+    public class CustomBooleanConverter implements AttributeConverter<Boolean, Character> {
+        ...
+    }
+
+----
+====
+
+NOTE: for this to work, the converter needs to be registered in the `persistence.xml`, since Hibernate doesn't auto-discover them (yet)
+====
+[source, XML, indent=0]
+----
+    <persistence-unit ...>
+        ...
+        <class>CustomBooleanConverter</class>
+        ...
+    </persistence-unit>
+----
+====
+
+
+== Hibernate extensions
+
+=== `@JavaType`
+
+In general the standard `BooleanJavaType` will cover most cases of possible mappings for a boolean attribute. If not, one can always implement a custom extension of the new `JavaType` interface that was introduced in ORM 6, to cover any special needs. This custom `JavaType` can then be applied that either locally to a specific attribute with the new `@JavaType` annotation, or globally, by annotating the custom `JavaType` with the new `@JavaTypeRegistry` annotation.
+See the user guide section on link:{user-guide-url}#basic-mapping-composition[compositional basic mapping] for more info on how to do this.
+
+=== `@JdbcTypeCode / @JdbcType`
+
+If one wants to map a specific boolean attribute to something different from the default for the current database, then the easiest way to achieve this is to annotate that attribute with the desired `@JdbcTypeCode`, or with `@JdbcType` and the desired `JdbcType` implementor. In the latter case one can either use an implementation provided by Hibernate that accounts for the desired transformation, or provide a custom implementation.
+
+.Apply a specific Jdbc Type locally to a Boolean
+====
+[source, JAVA, indent=0]
+----
+    // this Boolean attribute will be converted to a CHAR in the database
+    @JdbcTypeCode(SqlTypes.CHAR)
+    private Boolean toCharBoolean;
+
+    // this Boolean attribute will be converted to a SMALLINT in the database
+    @JdbcType( SmallIntJdbcType.class )
+    private Boolean toSmallIntBoolean;
+----
+====
+
+If the default Boolean mapping to the database needs to change on an application-wide basis, then one would use the `@JdbcTypeRegistry` annotation as shown below:
+
+.Apply a specific Jdbc Type globally to all Boolean attributes
+====
+[source, JAVA, indent=0]
+----
+
+    @Entity
+    @JdbcTypeRegistration(registrationCode = Types.BOOLEAN, value = SmallIntJdbcType.class)
+    public static class AnEntity {
+        @Id
+        private Integer id;
+
+        private Boolean someBooleanAttribute;
+
+        //Getters and setters omitted for brevity
+    }
+----
+====
+
+Check out the link:{user-guide-url}#basic[User Guide] for more examples.
+
